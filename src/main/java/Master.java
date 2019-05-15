@@ -3,6 +3,7 @@ import org.apache.zookeeper.*;
 import org.apache.zookeeper.data.Stat;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.Random;
 
 import static org.apache.zookeeper.ZooDefs.Ids.OPEN_ACL_UNSAFE;
@@ -15,6 +16,7 @@ public class Master {
     private Logger log;
     private String hostPort;
     private MasterStates state;
+    private ChildrenCache workersCache;
 
     public Master(String hostPort) {
         this.log = Logger.getLogger(Master.class);
@@ -38,6 +40,7 @@ public class Master {
                 return;
             case OK:
                 state = MasterStates.ELECTED;
+                takeLeaderShip();
                 break;
             case NODEEXISTS:
                 state = MasterStates.NOTELECTED;
@@ -48,6 +51,11 @@ public class Master {
                 log.error("Something went wrong when running for master.", KeeperException.create(KeeperException.Code.get(rc), path));
         }
         log.info("I'm " + (state == MasterStates.ELECTED ? "" : "not ") + "the leader");
+    }
+
+    private void takeLeaderShip() {
+        log.info("Going for list of workers");
+        getWorkers();
     }
 
     private void masterCheckCallback(int rc, String path, Object ctx, byte[] data,
@@ -62,13 +70,14 @@ public class Master {
             case OK:
                 if (serverId.equals(new String(data))) {
                     state = MasterStates.ELECTED;
+                    takeLeaderShip();
                 } else {
                     state = MasterStates.NOTELECTED;
                     masterExists();
                 }
                 break;
             default:
-                    log.error("Error when reading data.", KeeperException.create(KeeperException.Code.get(rc), path));
+                log.error("Error when reading data.", KeeperException.create(KeeperException.Code.get(rc), path));
         }
     }
 
@@ -100,6 +109,65 @@ public class Master {
         if (watchedEvent.getType().equals(Watcher.Event.EventType.NodeDeleted)) {
             assert "/master".equals(watchedEvent.getPath());
             runForMaster();
+        }
+    }
+
+    public void getWorkers() {
+        zk.getChildren("/workers", this::workersChangeWatcher, this::workerGetChildrenCallback, "/workers");
+    }
+
+    private void workerGetChildrenCallback(int rc, String path, Object ctx, List<String> children, Stat stat) {
+        switch (KeeperException.Code.get(rc)) {
+            case CONNECTIONLOSS:
+                getWorkers();
+                break;
+            case OK:
+                log.info("Successfully got a list of workers: " + children.size() + " workers");
+                reassignAndSet(children);
+                break;
+            default:
+                log.error("getChildren failed", KeeperException.create(KeeperException.Code.get(rc), path));
+        }
+    }
+
+    private void reassignAndSet(List<String> children) {
+        List<String> toProcess;
+        if(children == null) return;
+        if (workersCache == null) {
+            workersCache = new ChildrenCache(children);
+            toProcess = null;
+        } else {
+            log.info("Removing and setting");
+            toProcess = workersCache.removeAndSet(children);
+        }
+        if (toProcess != null) {
+            for (String worker : toProcess) {
+                getAbsentWorkerTasks(worker);
+            }
+        }
+    }
+
+    private void getAbsentWorkerTasks(String worker) {
+        zk.getChildren("/assign/" + worker, false, this::workerAssignmentCallback, worker);
+    }
+
+    private void workerAssignmentCallback(int rc, String path, Object ctx, List<String> children) {
+        switch (KeeperException.Code.get(rc)) {
+            case CONNECTIONLOSS:
+                getAbsentWorkerTasks((String) ctx);
+                break;
+            case OK:
+                log.info("Successfully got a list of assignments: " + children.size() + " tasks");
+                break;
+            default:
+                log.error("getChildren failed", KeeperException.create(KeeperException.Code.get(rc), path));
+        }
+    }
+
+    private void workersChangeWatcher(WatchedEvent watchedEvent) {
+        if (watchedEvent.getType() == Watcher.Event.EventType.NodeChildrenChanged) {
+            assert "/workers".equals(watchedEvent.getPath());
+            getWorkers();
         }
     }
 
